@@ -133,7 +133,9 @@ def make_matmul(name, n, device):
         )
     if name == "int8":
         a = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8)
-        b = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8)
+        # cuBLASLt's int8 tensor-core kernels want the second operand transposed (TN layout);
+        # other layouts fall back to much slower kernels.
+        b = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8).t()
         return lambda: torch._int_mm(a, b)
 
     dtype = PRECISIONS[name][0]
