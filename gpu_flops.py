@@ -42,12 +42,12 @@ PRECISIONS = {
 # and newer, hmma/wmma/tensorop = generic markers.
 TENSOR_CORE_KERNEL_MARKERS = (
     "s884", "s1688", "s16816", "h884", "h1688", "h16816", "hmma", "wmma", "tensorop",
-    "xmma", "gmma", "wgmma", "warpgroup",
+    "xmma", "gmma", "wgmma", "warpgroup", "nvjet",
 )
 
 # Substrings of kernel names that are plain SIMT GEMMs (no tensor cores), checked first
-# so that e.g. an fp32 "sgemm" kernel is never mistaken for a tensor-core kernel.
-NON_TENSOR_CORE_KERNEL_MARKERS = ("sgemm", "dgemm", "gemv")
+# so that e.g. an fp32 "sgemm" or "ffma" kernel is never mistaken for a tensor-core kernel.
+NON_TENSOR_CORE_KERNEL_MARKERS = ("sgemm", "dgemm", "gemv", "ffma")
 
 # Tensor cores need the GEMM dimensions to be multiples of 8 for fp16/bf16 (16 bytes).
 TENSOR_CORE_ALIGNMENT = 8
