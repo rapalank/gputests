@@ -21,6 +21,7 @@ Examples:
 import argparse
 import json
 import platform
+import statistics
 import sys
 import time
 
@@ -162,15 +163,19 @@ def run_precision(name, n, device, warmup, iters):
     except (RuntimeError, NotImplementedError) as err:
         return {"precision": name, "error": str(err).splitlines()[0]}
 
-    median_s = sorted(times)[len(times) // 2]
-    best_s = min(times)
+    mean_s = statistics.mean(times)
+    tflops = [flops / t / 1e12 for t in times]
     return {
         "precision": name,
         "tensor_cores": tensor_cores,
         "kernels": kernels,
-        "tflops_median": flops / median_s / 1e12,
-        "tflops_best": flops / best_s / 1e12,
-        "ms_median": median_s * 1e3,
+        "tflops_mean": statistics.mean(tflops),
+        "tflops_best": max(tflops),
+        "tflops_worst": min(tflops),
+        "tflops_cv_percent": 100 * statistics.stdev(tflops) / statistics.mean(tflops)
+        if len(tflops) > 1
+        else 0.0,
+        "ms_mean": mean_s * 1e3,
     }
 
 
@@ -180,22 +185,27 @@ def format_tensor_cores(value):
 
 def print_table(results, peaks, show_kernels):
     print(
-        f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}"
-        f"{'ms/matmul':>12}{'Tensor cores':>15}{'Peak TFLOPS':>13}{'% of peak':>11}"
+        "TFLOPS columns: best = fastest iteration, worst = slowest, "
+        "CV = std dev / mean across iterations, in percent"
     )
-    print("-" * 95)
+    print(
+        f"{'Precision':<10}{'Mean':>10}{'Best':>10}{'Worst':>10}{'CV %':>10}"
+        f"{'ms/matmul':>11}{'Tensor cores':>14}{'Peak':>10}{'% of peak':>11}"
+    )
+    print("-" * 96)
     for r in results:
         if "error" in r:
             print(f"{r['precision']:<10}  skipped: {r['error']}")
             continue
         peak = peaks.get(r["precision"])
         peak_text = f"{peak:.1f}" if peak is not None else "n/a"
-        percent_text = f"{100 * r['tflops_median'] / peak:.1f}%" if peak is not None else "n/a"
+        percent_text = f"{100 * r['tflops_mean'] / peak:.1f}%" if peak is not None else "n/a"
         print(
-            f"{r['precision']:<10}{r['tflops_median']:>18.2f}"
-            f"{r['tflops_best']:>16.2f}{r['ms_median']:>12.2f}"
-            f"{format_tensor_cores(r['tensor_cores']):>15}"
-            f"{peak_text:>13}{percent_text:>11}"
+            f"{r['precision']:<10}{r['tflops_mean']:>10.2f}"
+            f"{r['tflops_best']:>10.2f}{r['tflops_worst']:>10.2f}{r['tflops_cv_percent']:>10.2f}"
+            f"{r['ms_mean']:>11.2f}"
+            f"{format_tensor_cores(r['tensor_cores']):>14}"
+            f"{peak_text:>10}{percent_text:>11}"
         )
         if show_kernels:
             for kernel in r["kernels"]:
