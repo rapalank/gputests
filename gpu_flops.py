@@ -12,6 +12,8 @@ Precisions:
   tf32  float32 inputs, TF32 tensor-core math enabled (CUDA only, Ampere+)
   fp16  float16
   bf16  bfloat16
+  fp8   float8 e4m3 inputs, bf16 output via torch._scaled_mm (CUDA, Hopper/Ada+)
+  int8  int8 inputs, int32 output via torch._int_mm (CUDA); reported as TOPS-equivalent
 
 Examples:
   python gpu_flops.py
@@ -36,6 +38,8 @@ PRECISIONS = {
     "tf32": (torch.float32, True),
     "fp16": (torch.float16, None),
     "bf16": (torch.bfloat16, None),
+    "fp8": (torch.float8_e4m3fn, None),
+    "int8": (torch.int8, None),
 }
 
 # Substrings of cuBLAS kernel names that run on tensor cores:
@@ -57,12 +61,18 @@ TENSOR_CORE_ALIGNMENT = 8
 # (model, variant, peaks): the model must appear in the device name, and the variant
 # (if not None) must too. More specific entries come first.
 THEORETICAL_PEAK_TFLOPS = [
-    ("H200", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989}),
-    ("H100", "PCIe", {"fp64": 51, "fp32": 51, "tf32": 378, "fp16": 756, "bf16": 756}),
-    ("H100", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989}),
-    ("A100", "PCIe", {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312}),
-    ("A100", None, {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312}),
-    ("L40S", None, {"fp64": 1.4, "fp32": 91.6, "tf32": 183, "fp16": 362, "bf16": 362}),
+    ("H200", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989,
+                    "fp8": 1979, "int8": 1979}),
+    ("H100", "PCIe", {"fp64": 51, "fp32": 51, "tf32": 378, "fp16": 756, "bf16": 756,
+                      "fp8": 1513, "int8": 1513}),
+    ("H100", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989,
+                    "fp8": 1979, "int8": 1979}),
+    ("A100", "PCIe", {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312,
+                      "int8": 624}),
+    ("A100", None, {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312,
+                    "int8": 624}),
+    ("L40S", None, {"fp64": 1.4, "fp32": 91.6, "tf32": 183, "fp16": 362, "bf16": 362,
+                    "fp8": 733, "int8": 733}),
     ("V100", None, {"fp64": 7.8, "fp32": 15.7, "fp16": 125}),
 ]
 
@@ -109,7 +119,31 @@ def is_tensor_core_kernel(name):
     return any(marker in name for marker in TENSOR_CORE_KERNEL_MARKERS)
 
 
-def uses_tensor_cores(dtype, n, device):
+def make_matmul(name, n, device):
+    """Return a zero-argument function that runs one n x n GEMM at precision `name`."""
+    if name == "fp8":
+        if not hasattr(torch, "_scaled_mm"):
+            raise NotImplementedError("torch._scaled_mm is not available in this PyTorch build")
+        # _scaled_mm needs its second operand column-major, hence the transpose.
+        a = torch.randn(n, n, device=device).to(torch.float8_e4m3fn)
+        b = torch.randn(n, n, device=device).to(torch.float8_e4m3fn).t()
+        scale = torch.ones((), device=device, dtype=torch.float32)
+        return lambda: torch._scaled_mm(
+            a, b, scale_a=scale, scale_b=scale, out_dtype=torch.bfloat16
+        )
+    if name == "int8":
+        a = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8)
+        b = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8)
+        return lambda: torch._int_mm(a, b)
+
+    dtype = PRECISIONS[name][0]
+    a = torch.randn(n, n, device=device, dtype=dtype)
+    b = torch.randn(n, n, device=device, dtype=dtype)
+    c = torch.empty(n, n, device=device, dtype=dtype)
+    return lambda: torch.mm(a, b, out=c)
+
+
+def uses_tensor_cores(op, device):
     """Return (tensor_cores, kernel_names). tensor_cores is True/False, or None if unknown.
 
     Profiles one matmul and inspects the CUDA kernel names. Only CUDA exposes this;
@@ -118,13 +152,11 @@ def uses_tensor_cores(dtype, n, device):
     if device.type != "cuda":
         return None, []
 
-    a = torch.randn(n, n, device=device, dtype=dtype)
-    b = torch.randn(n, n, device=device, dtype=dtype)
-    torch.mm(a, b)  # warm up so cuBLAS has selected its kernel before profiling
+    op()  # warm up so cuBLAS has selected its kernel before profiling
     torch.cuda.synchronize(device)
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        torch.mm(a, b)
+        op()
         torch.cuda.synchronize(device)
 
     kernels = [e.name for e in prof.events() if e.device_type == DeviceType.CUDA]
@@ -133,33 +165,30 @@ def uses_tensor_cores(dtype, n, device):
     return any(is_tensor_core_kernel(k.lower()) for k in kernels), kernels
 
 
-def time_matmul(dtype, n, device, warmup, iters):
-    a = torch.randn(n, n, device=device, dtype=dtype)
-    b = torch.randn(n, n, device=device, dtype=dtype)
-    c = torch.empty(n, n, device=device, dtype=dtype)
-
+def time_matmul(op, device, warmup, iters):
     for _ in range(warmup):
-        torch.mm(a, b, out=c)
+        op()
     sync(device)
 
     times = []
     for _ in range(iters):
         start = time.perf_counter()
-        torch.mm(a, b, out=c)
+        op()
         sync(device)
         times.append(time.perf_counter() - start)
     return times
 
 
 def run_precision(name, n, device, warmup, iters):
-    dtype, tf32 = PRECISIONS[name]
+    _, tf32 = PRECISIONS[name]
     if tf32 is not None:
         torch.backends.cuda.matmul.allow_tf32 = tf32
 
     flops = 2 * n**3
     try:
-        times = time_matmul(dtype, n, device, warmup, iters)
-        tensor_cores, kernels = uses_tensor_cores(dtype, n, device)
+        op = make_matmul(name, n, device)
+        times = time_matmul(op, device, warmup, iters)
+        tensor_cores, kernels = uses_tensor_cores(op, device)
     except (RuntimeError, NotImplementedError) as err:
         return {"precision": name, "error": str(err).splitlines()[0]}
 
@@ -268,6 +297,9 @@ def main():
                 continue
             if name == "fp64" and device.type == "mps":
                 results.append({"precision": name, "error": "MPS has no float64"})
+                continue
+            if name == "fp8" and device.type == "mps":
+                results.append({"precision": name, "error": "MPS has no float8"})
                 continue
             results.append(run_precision(name, args.size, device, args.warmup, args.iters))
     finally:
