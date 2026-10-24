@@ -189,7 +189,7 @@ def print_table(results, peaks, show_kernels):
         "CV = std dev / mean across iterations, in percent"
     )
     print(
-        f"{'Precision':<10}{'Mean':>10}{'Best':>10}{'Worst':>10}{'CV %':>10}"
+        f"{'Precision':<10}{'Worst':>10}{'Mean':>10}{'Best':>10}{'CV %':>10}"
         f"{'ms/matmul':>11}{'Tensor cores':>14}{'Peak':>10}{'% of peak':>11}"
     )
     print("-" * 96)
@@ -201,8 +201,8 @@ def print_table(results, peaks, show_kernels):
         peak_text = f"{peak:.1f}" if peak is not None else "n/a"
         percent_text = f"{100 * r['tflops_mean'] / peak:.1f}%" if peak is not None else "n/a"
         print(
-            f"{r['precision']:<10}{r['tflops_mean']:>10.2f}"
-            f"{r['tflops_best']:>10.2f}{r['tflops_worst']:>10.2f}{r['tflops_cv_percent']:>10.2f}"
+            f"{r['precision']:<10}{r['tflops_worst']:>10.2f}"
+            f"{r['tflops_mean']:>10.2f}{r['tflops_best']:>10.2f}{r['tflops_cv_percent']:>10.2f}"
             f"{r['ms_mean']:>11.2f}"
             f"{format_tensor_cores(r['tensor_cores']):>14}"
             f"{peak_text:>10}{percent_text:>11}"
