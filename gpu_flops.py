@@ -21,6 +21,7 @@ Examples:
   python gpu_flops.py --device cuda:1 --json
 """
 import argparse
+import contextlib
 import json
 import platform
 import statistics
@@ -261,11 +262,78 @@ def print_table(results, peaks, show_kernels, color):
         )
 
 
+def resolve_devices(name):
+    """Return the devices to benchmark. 'auto' uses every CUDA device if there are any."""
+    if name == "auto":
+        if torch.cuda.is_available():
+            return [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+        return [pick_device("auto")]
+    device = pick_device(name)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return [device]
+
+
+def benchmark_device(device, args):
+    """Run every requested precision on one device and return its report."""
+    results = []
+    original_tf32 = torch.backends.cuda.matmul.allow_tf32
+    # Entering the device context keeps CUDA events and streams on this device.
+    context = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
+    try:
+        with context:
+            for name in args.precisions:
+                if name == "tf32" and device.type != "cuda":
+                    results.append({"precision": name, "error": "TF32 is CUDA-only"})
+                    continue
+                if name == "fp64" and device.type == "mps":
+                    results.append({"precision": name, "error": "MPS has no float64"})
+                    continue
+                if name == "fp8" and device.type == "mps":
+                    results.append({"precision": name, "error": "MPS has no float8"})
+                    continue
+                results.append(run_precision(name, args.size, device, args.warmup, args.iters))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original_tf32
+
+    return {
+        "device": str(device),
+        "device_name": device_name(device),
+        "theoretical_peak_tflops": theoretical_peak(device),
+        "results": results,
+    }
+
+
+def print_variation(reports):
+    print()
+    print(f"Variation across {len(reports)} devices (mean TFLOPS):")
+    print(f"{'Precision':<10}{'Min':>10}{'Max':>10}{'Mean':>10}{'CV %':>10}")
+    print("-" * 50)
+    for name in PRECISIONS:
+        means = [
+            r["tflops_mean"]
+            for report in reports
+            for r in report["results"]
+            if r["precision"] == name and "error" not in r
+        ]
+        if len(means) < 2:
+            continue
+        mean = statistics.mean(means)
+        if mean == 0:
+            continue
+        cv = 100 * statistics.stdev(means) / mean
+        print(f"{name:<10}{min(means):>10.2f}{max(means):>10.2f}{mean:>10.2f}{cv:>10.2f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto (every CUDA device if any, else mps or cpu), cuda, cuda:N, mps or cpu",
+    )
     parser.add_argument("--size", type=int, default=8192, help="matrix dimension N (default 8192)")
     parser.add_argument("--warmup", type=int, default=5, help="untimed iterations per precision")
     parser.add_argument("--iters", type=int, default=20, help="timed iterations per precision")
@@ -284,9 +352,7 @@ def main():
     )
     args = parser.parse_args()
 
-    device = pick_device(args.device)
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    devices = resolve_devices(args.device)
 
     if args.size % TENSOR_CORE_ALIGNMENT:
         print(
@@ -295,46 +361,32 @@ def main():
             file=sys.stderr,
         )
 
-    original_tf32 = torch.backends.cuda.matmul.allow_tf32
-    results = []
-    try:
-        for name in args.precisions:
-            if name == "tf32" and device.type != "cuda":
-                results.append({"precision": name, "error": "TF32 is CUDA-only"})
-                continue
-            if name == "fp64" and device.type == "mps":
-                results.append({"precision": name, "error": "MPS has no float64"})
-                continue
-            if name == "fp8" and device.type == "mps":
-                results.append({"precision": name, "error": "MPS has no float8"})
-                continue
-            results.append(run_precision(name, args.size, device, args.warmup, args.iters))
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = original_tf32
-
-    peaks = theoretical_peak(device)
+    reports = [benchmark_device(device, args) for device in devices]
     info = {
-        "device": str(device),
-        "device_name": device_name(device),
         "torch": torch.__version__,
         "matrix_size": args.size,
-        "theoretical_peak_tflops": peaks,
-        "results": results,
+        "devices": reports,
     }
 
     if args.json:
         print(json.dumps(info, indent=2))
-    else:
-        print(f"Device:      {info['device_name']} [{info['device']}]")
-        print(f"PyTorch:     {info['torch']}")
-        print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
+        return
+
+    print(f"PyTorch:     {info['torch']}")
+    print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
+    for report in reports:
+        peaks = report["theoretical_peak_tflops"]
+        print()
+        print(f"Device:      {report['device_name']} [{report['device']}]")
         if peaks:
             print("Theoretical peak TFLOPS (dense, datasheet):")
             print("  " + ", ".join(f"{p}={v:g}" for p, v in peaks.items()))
         else:
             print("Theoretical peak: unknown for this device (not in the datasheet table)")
         print()
-        print_table(results, peaks, args.show_kernels, sys.stdout.isatty())
+        print_table(report["results"], peaks, args.show_kernels, sys.stdout.isatty())
+    if len(reports) > 1:
+        print_variation(reports)
 
 
 if __name__ == "__main__":
