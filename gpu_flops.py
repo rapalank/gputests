@@ -52,6 +52,19 @@ NON_TENSOR_CORE_KERNEL_MARKERS = ("sgemm", "dgemm", "gemv", "ffma")
 # Tensor cores need the GEMM dimensions to be multiples of 8 for fp16/bf16 (16 bytes).
 TENSOR_CORE_ALIGNMENT = 8
 
+# Theoretical peak TFLOPS from NVIDIA datasheets, dense (no sparsity). Each entry is
+# (model, variant, peaks): the model must appear in the device name, and the variant
+# (if not None) must too. More specific entries come first.
+THEORETICAL_PEAK_TFLOPS = [
+    ("H200", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989}),
+    ("H100", "PCIe", {"fp64": 51, "fp32": 51, "tf32": 378, "fp16": 756, "bf16": 756}),
+    ("H100", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989}),
+    ("A100", "PCIe", {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312}),
+    ("A100", None, {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312}),
+    ("L40S", None, {"fp64": 1.4, "fp32": 91.6, "tf32": 183, "fp16": 362, "bf16": 362}),
+    ("V100", None, {"fp64": 7.8, "fp32": 15.7, "fp16": 125}),
+]
+
 
 def pick_device(name):
     if name != "auto":
@@ -69,6 +82,17 @@ def device_name(device):
     if device.type == "mps":
         return f"Apple MPS ({platform.processor() or platform.machine()})"
     return f"CPU ({platform.processor() or platform.machine()})"
+
+
+def theoretical_peak(device):
+    """Return {precision: peak TFLOPS} from the datasheet table, or {} if the GPU is unknown."""
+    if device.type != "cuda":
+        return {}
+    name = torch.cuda.get_device_name(device)
+    for model, variant, peaks in THEORETICAL_PEAK_TFLOPS:
+        if model in name and (variant is None or variant in name):
+            return peaks
+    return {}
 
 
 def sync(device):
@@ -154,20 +178,24 @@ def format_tensor_cores(value):
     return {True: "yes", False: "NO", None: "n/a"}[value]
 
 
-def print_table(results, show_kernels):
+def print_table(results, peaks, show_kernels):
     print(
         f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}"
-        f"{'ms/matmul':>12}{'Tensor cores':>15}"
+        f"{'ms/matmul':>12}{'Tensor cores':>15}{'Peak TFLOPS':>13}{'% of peak':>11}"
     )
-    print("-" * 71)
+    print("-" * 95)
     for r in results:
         if "error" in r:
             print(f"{r['precision']:<10}  skipped: {r['error']}")
             continue
+        peak = peaks.get(r["precision"])
+        peak_text = f"{peak:.1f}" if peak is not None else "n/a"
+        percent_text = f"{100 * r['tflops_median'] / peak:.1f}%" if peak is not None else "n/a"
         print(
             f"{r['precision']:<10}{r['tflops_median']:>18.2f}"
             f"{r['tflops_best']:>16.2f}{r['ms_median']:>12.2f}"
             f"{format_tensor_cores(r['tensor_cores']):>15}"
+            f"{peak_text:>13}{percent_text:>11}"
         )
         if show_kernels:
             for kernel in r["kernels"]:
@@ -222,11 +250,13 @@ def main():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = original_tf32
 
+    peaks = theoretical_peak(device)
     info = {
         "device": str(device),
         "device_name": device_name(device),
         "torch": torch.__version__,
         "matrix_size": args.size,
+        "theoretical_peak_tflops": peaks,
         "results": results,
     }
 
@@ -236,8 +266,13 @@ def main():
         print(f"Device:      {info['device_name']} [{info['device']}]")
         print(f"PyTorch:     {info['torch']}")
         print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
+        if peaks:
+            print("Theoretical peak TFLOPS (dense, datasheet):")
+            print("  " + ", ".join(f"{p}={v:g}" for p, v in peaks.items()))
+        else:
+            print("Theoretical peak: unknown for this device (not in the datasheet table)")
         print()
-        print_table(results, args.show_kernels)
+        print_table(results, peaks, args.show_kernels)
 
 
 if __name__ == "__main__":
