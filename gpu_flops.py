@@ -254,6 +254,11 @@ def print_table(results, peaks, show_kernels, color):
         if show_kernels:
             for kernel in r["kernels"]:
                 print(f"    kernel: {kernel}")
+    if any(r["precision"] == "int8" and "error" not in r for r in results):
+        print(
+            "note: int8 runs through torch._int_mm, which picks Ampere-era cutlass_80 tensor-core "
+            "kernels on Hopper, so its throughput is below the Hopper int8 peak."
+        )
 
 
 def main():
