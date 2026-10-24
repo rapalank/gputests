@@ -172,9 +172,7 @@ def run_precision(name, n, device, warmup, iters):
         "tflops_mean": statistics.mean(tflops),
         "tflops_best": max(tflops),
         "tflops_worst": min(tflops),
-        "tflops_cv_percent": 100 * statistics.stdev(tflops) / statistics.mean(tflops)
-        if len(tflops) > 1
-        else 0.0,
+        "tflops_stdev": statistics.stdev(tflops) if len(tflops) > 1 else 0.0,
         "ms_mean": mean_s * 1e3,
     }
 
@@ -183,16 +181,23 @@ def format_tensor_cores(value):
     return {True: "yes", False: "NO", None: "n/a"}[value]
 
 
-def print_table(results, peaks, show_kernels):
+def bold_cell(text, width, enabled):
+    # Pad before adding the escape codes so the ANSI bytes don't throw off column alignment.
+    padded = f"{text:>{width}}"
+    return f"\033[1m{padded}\033[0m" if enabled else padded
+
+
+def print_table(results, peaks, show_kernels, color):
     print(
-        "TFLOPS columns: best = fastest iteration, worst = slowest, "
-        "CV = std dev / mean across iterations, in percent"
+        "TFLOPS columns: best = fastest iteration, worst = slowest. "
+        "Std % peak = std dev across iterations as a percent of theoretical peak"
     )
     print(
-        f"{'Precision':<10}{'Worst':>10}{'Mean':>10}{'Best':>10}{'CV %':>10}"
-        f"{'ms/matmul':>11}{'Tensor cores':>14}{'Peak':>10}{'% of peak (worst-best)':>24}"
+        f"{'Precision':<10}{'Worst':>10}{'Mean':>10}{'Best':>10}"
+        f"{'Peak':>10}{bold_cell('% of peak (worst-best)', 24, color)}"
+        f"{'Std % peak':>12}{'ms/matmul':>11}{'Tensor cores':>14}"
     )
-    print("-" * 109)
+    print("-" * 111)
     for r in results:
         if "error" in r:
             print(f"{r['precision']:<10}  skipped: {r['error']}")
@@ -203,14 +208,17 @@ def print_table(results, peaks, show_kernels):
             percent_text = (
                 f"{100 * r['tflops_worst'] / peak:.1f}% - {100 * r['tflops_best'] / peak:.1f}%"
             )
+            std_text = f"{100 * r['tflops_stdev'] / peak:.2f}"
         else:
             percent_text = "n/a"
+            std_text = "n/a"
         print(
             f"{r['precision']:<10}{r['tflops_worst']:>10.2f}"
-            f"{r['tflops_mean']:>10.2f}{r['tflops_best']:>10.2f}{r['tflops_cv_percent']:>10.2f}"
+            f"{r['tflops_mean']:>10.2f}{r['tflops_best']:>10.2f}"
+            f"{peak_text:>10}{bold_cell(percent_text, 24, color)}"
+            f"{std_text:>12}"
             f"{r['ms_mean']:>11.2f}"
             f"{format_tensor_cores(r['tensor_cores']):>14}"
-            f"{peak_text:>10}{percent_text:>24}"
         )
         if show_kernels:
             for kernel in r["kernels"]:
@@ -287,7 +295,7 @@ def main():
         else:
             print("Theoretical peak: unknown for this device (not in the datasheet table)")
         print()
-        print_table(results, peaks, args.show_kernels)
+        print_table(results, peaks, args.show_kernels, sys.stdout.isatty())
 
 
 if __name__ == "__main__":
