@@ -21,9 +21,12 @@ Examples:
 import argparse
 import json
 import platform
+import sys
 import time
 
 import torch
+from torch.autograd import DeviceType
+from torch.profiler import ProfilerActivity, profile
 
 # name -> (dtype, requires TF32 flag on CUDA matmul, or None)
 PRECISIONS = {
@@ -33,6 +36,15 @@ PRECISIONS = {
     "fp16": (torch.float16, None),
     "bf16": (torch.bfloat16, None),
 }
+
+# Substrings of cuBLAS kernel names that run on tensor cores:
+# s884/s1688/s16816 = HMMA tile shapes (Volta/Turing/Ampere+), tensorop/hmma/wmma = generic markers.
+TENSOR_CORE_KERNEL_MARKERS = (
+    "s884", "s1688", "s16816", "h884", "h1688", "h16816", "hmma", "wmma", "tensorop",
+)
+
+# Tensor cores need the GEMM dimensions to be multiples of 8 for fp16/bf16 (16 bytes).
+TENSOR_CORE_ALIGNMENT = 8
 
 
 def pick_device(name):
@@ -58,6 +70,30 @@ def sync(device):
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def uses_tensor_cores(dtype, n, device):
+    """Return True/False if the GEMM kernel does/doesn't use tensor cores, None if unknown.
+
+    Profiles one matmul and inspects the CUDA kernel names. Only CUDA exposes this;
+    MPS and CPU do not report which matrix units a kernel uses, so the result is None.
+    """
+    if device.type != "cuda":
+        return None
+
+    a = torch.randn(n, n, device=device, dtype=dtype)
+    b = torch.randn(n, n, device=device, dtype=dtype)
+    torch.mm(a, b)  # warm up so cuBLAS has selected its kernel before profiling
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        torch.mm(a, b)
+        torch.cuda.synchronize(device)
+
+    kernels = [e.name.lower() for e in prof.events() if e.device_type == DeviceType.CUDA]
+    if not kernels:
+        return None
+    return any(marker in name for name in kernels for marker in TENSOR_CORE_KERNEL_MARKERS)
 
 
 def time_matmul(dtype, n, device, warmup, iters):
@@ -86,6 +122,7 @@ def run_precision(name, n, device, warmup, iters):
     flops = 2 * n**3
     try:
         times = time_matmul(dtype, n, device, warmup, iters)
+        tensor_cores = uses_tensor_cores(dtype, n, device)
     except (RuntimeError, NotImplementedError) as err:
         return {"precision": name, "error": str(err).splitlines()[0]}
 
@@ -93,15 +130,23 @@ def run_precision(name, n, device, warmup, iters):
     best_s = min(times)
     return {
         "precision": name,
+        "tensor_cores": tensor_cores,
         "tflops_median": flops / median_s / 1e12,
         "tflops_best": flops / best_s / 1e12,
         "ms_median": median_s * 1e3,
     }
 
 
+def format_tensor_cores(value):
+    return {True: "yes", False: "NO", None: "n/a"}[value]
+
+
 def print_table(results):
-    print(f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}{'ms/matmul':>12}")
-    print("-" * 56)
+    print(
+        f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}"
+        f"{'ms/matmul':>12}{'Tensor cores':>15}"
+    )
+    print("-" * 71)
     for r in results:
         if "error" in r:
             print(f"{r['precision']:<10}  skipped: {r['error']}")
@@ -109,6 +154,7 @@ def print_table(results):
         print(
             f"{r['precision']:<10}{r['tflops_median']:>18.2f}"
             f"{r['tflops_best']:>16.2f}{r['ms_median']:>12.2f}"
+            f"{format_tensor_cores(r['tensor_cores']):>15}"
         )
 
 
@@ -133,6 +179,13 @@ def main():
     device = pick_device(args.device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
+
+    if args.size % TENSOR_CORE_ALIGNMENT:
+        print(
+            f"warning: --size {args.size} is not a multiple of {TENSOR_CORE_ALIGNMENT}; "
+            "tensor cores may not be used",
+            file=sys.stderr,
+        )
 
     original_tf32 = torch.backends.cuda.matmul.allow_tf32
     results = []
