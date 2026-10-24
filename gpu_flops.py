@@ -38,10 +38,16 @@ PRECISIONS = {
 }
 
 # Substrings of cuBLAS kernel names that run on tensor cores:
-# s884/s1688/s16816 = HMMA tile shapes (Volta/Turing/Ampere+), tensorop/hmma/wmma = generic markers.
+# s884/s1688/s16816 = HMMA tile shapes (Volta/Turing/Ampere), xmma/gmma/wgmma/warpgroup = Hopper
+# and newer, hmma/wmma/tensorop = generic markers.
 TENSOR_CORE_KERNEL_MARKERS = (
     "s884", "s1688", "s16816", "h884", "h1688", "h16816", "hmma", "wmma", "tensorop",
+    "xmma", "gmma", "wgmma", "warpgroup",
 )
+
+# Substrings of kernel names that are plain SIMT GEMMs (no tensor cores), checked first
+# so that e.g. an fp32 "sgemm" kernel is never mistaken for a tensor-core kernel.
+NON_TENSOR_CORE_KERNEL_MARKERS = ("sgemm", "dgemm", "gemv")
 
 # Tensor cores need the GEMM dimensions to be multiples of 8 for fp16/bf16 (16 bytes).
 TENSOR_CORE_ALIGNMENT = 8
@@ -72,14 +78,20 @@ def sync(device):
         torch.mps.synchronize()
 
 
+def is_tensor_core_kernel(name):
+    if any(marker in name for marker in NON_TENSOR_CORE_KERNEL_MARKERS):
+        return False
+    return any(marker in name for marker in TENSOR_CORE_KERNEL_MARKERS)
+
+
 def uses_tensor_cores(dtype, n, device):
-    """Return True/False if the GEMM kernel does/doesn't use tensor cores, None if unknown.
+    """Return (tensor_cores, kernel_names). tensor_cores is True/False, or None if unknown.
 
     Profiles one matmul and inspects the CUDA kernel names. Only CUDA exposes this;
     MPS and CPU do not report which matrix units a kernel uses, so the result is None.
     """
     if device.type != "cuda":
-        return None
+        return None, []
 
     a = torch.randn(n, n, device=device, dtype=dtype)
     b = torch.randn(n, n, device=device, dtype=dtype)
@@ -90,10 +102,10 @@ def uses_tensor_cores(dtype, n, device):
         torch.mm(a, b)
         torch.cuda.synchronize(device)
 
-    kernels = [e.name.lower() for e in prof.events() if e.device_type == DeviceType.CUDA]
+    kernels = [e.name for e in prof.events() if e.device_type == DeviceType.CUDA]
     if not kernels:
-        return None
-    return any(marker in name for name in kernels for marker in TENSOR_CORE_KERNEL_MARKERS)
+        return None, []
+    return any(is_tensor_core_kernel(k.lower()) for k in kernels), kernels
 
 
 def time_matmul(dtype, n, device, warmup, iters):
@@ -122,7 +134,7 @@ def run_precision(name, n, device, warmup, iters):
     flops = 2 * n**3
     try:
         times = time_matmul(dtype, n, device, warmup, iters)
-        tensor_cores = uses_tensor_cores(dtype, n, device)
+        tensor_cores, kernels = uses_tensor_cores(dtype, n, device)
     except (RuntimeError, NotImplementedError) as err:
         return {"precision": name, "error": str(err).splitlines()[0]}
 
@@ -131,6 +143,7 @@ def run_precision(name, n, device, warmup, iters):
     return {
         "precision": name,
         "tensor_cores": tensor_cores,
+        "kernels": kernels,
         "tflops_median": flops / median_s / 1e12,
         "tflops_best": flops / best_s / 1e12,
         "ms_median": median_s * 1e3,
@@ -141,7 +154,7 @@ def format_tensor_cores(value):
     return {True: "yes", False: "NO", None: "n/a"}[value]
 
 
-def print_table(results):
+def print_table(results, show_kernels):
     print(
         f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}"
         f"{'ms/matmul':>12}{'Tensor cores':>15}"
@@ -156,6 +169,9 @@ def print_table(results):
             f"{r['tflops_best']:>16.2f}{r['ms_median']:>12.2f}"
             f"{format_tensor_cores(r['tensor_cores']):>15}"
         )
+        if show_kernels:
+            for kernel in r["kernels"]:
+                print(f"    kernel: {kernel}")
 
 
 def main():
@@ -174,6 +190,11 @@ def main():
         help="precisions to test (default: all)",
     )
     parser.add_argument("--json", action="store_true", help="print results as JSON")
+    parser.add_argument(
+        "--show-kernels",
+        action="store_true",
+        help="list the CUDA kernel names behind each result (useful when checking tensor cores)",
+    )
     args = parser.parse_args()
 
     device = pick_device(args.device)
@@ -216,7 +237,7 @@ def main():
         print(f"PyTorch:     {info['torch']}")
         print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
         print()
-        print_table(results)
+        print_table(results, args.show_kernels)
 
 
 if __name__ == "__main__":
