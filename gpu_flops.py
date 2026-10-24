@@ -43,6 +43,9 @@ PRECISIONS = {
     "int8": (torch.int8, None),
 }
 
+# Run by default. fp8 and int8 are available with --precisions.
+DEFAULT_PRECISIONS = ["fp64", "fp32", "tf32", "fp16", "bf16"]
+
 # Substrings of cuBLAS kernel names that run on tensor cores:
 # s884/s1688/s16816 = HMMA tile shapes (Volta/Turing/Ampere), xmma/gmma/wgmma/warpgroup = Hopper
 # and newer, hmma/wmma/tensorop = generic markers.
@@ -305,24 +308,25 @@ def benchmark_device(device, args):
 
 
 def print_variation(reports):
+    """Summarize each precision's mean % of peak across devices, skipping devices without a peak."""
     print()
-    print(f"Variation across {len(reports)} devices (mean TFLOPS):")
-    print(f"{'Precision':<10}{'Min':>10}{'Max':>10}{'Mean':>10}{'CV %':>10}")
+    print(f"Variation across {len(reports)} devices (mean TFLOPS as % of theoretical peak):")
+    print(f"{'Precision':<10}{'Min %':>10}{'Mean %':>10}{'Max %':>10}{'CV %':>10}")
     print("-" * 50)
     for name in PRECISIONS:
-        means = [
-            r["tflops_mean"]
-            for report in reports
-            for r in report["results"]
-            if r["precision"] == name and "error" not in r
-        ]
-        if len(means) < 2:
+        percents = []
+        for report in reports:
+            peak = report["theoretical_peak_tflops"].get(name)
+            if not peak:
+                continue
+            for r in report["results"]:
+                if r["precision"] == name and "error" not in r:
+                    percents.append(100 * r["tflops_mean"] / peak)
+        if len(percents) < 2:
             continue
-        mean = statistics.mean(means)
-        if mean == 0:
-            continue
-        cv = 100 * statistics.stdev(means) / mean
-        print(f"{name:<10}{min(means):>10.2f}{max(means):>10.2f}{mean:>10.2f}{cv:>10.2f}")
+        mean = statistics.mean(percents)
+        cv = 100 * statistics.stdev(percents) / mean
+        print(f"{name:<10}{min(percents):>10.1f}{mean:>10.1f}{max(percents):>10.1f}{cv:>10.2f}")
 
 
 def main():
@@ -340,9 +344,9 @@ def main():
     parser.add_argument(
         "--precisions",
         nargs="+",
-        default=list(PRECISIONS),
+        default=DEFAULT_PRECISIONS,
         choices=list(PRECISIONS),
-        help="precisions to test (default: all)",
+        help=f"precisions to test (default: {' '.join(DEFAULT_PRECISIONS)})",
     )
     parser.add_argument("--json", action="store_true", help="print results as JSON")
     parser.add_argument(
