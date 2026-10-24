@@ -183,14 +183,21 @@ def format_tensor_cores(value):
     return {True: "yes", False: "NO", None: "n/a"}[value]
 
 
-def print_table(results, peaks, show_kernels):
+def bold_cell(text, width, enabled):
+    # Pad before adding the escape codes so the ANSI bytes don't throw off column alignment.
+    padded = f"{text:>{width}}"
+    return f"\033[1m{padded}\033[0m" if enabled else padded
+
+
+def print_table(results, peaks, show_kernels, color):
     print(
         "TFLOPS columns: best = fastest iteration, worst = slowest, "
         "CV = std dev / mean across iterations, in percent"
     )
     print(
-        f"{'Precision':<10}{'Worst':>10}{'Mean':>10}{'Best':>10}{'CV %':>10}"
-        f"{'ms/matmul':>11}{'Tensor cores':>14}{'Peak':>10}{'% of peak':>11}"
+        f"{'Precision':<10}{'Worst':>10}{bold_cell('Mean', 10, color)}{'Best':>10}"
+        f"{bold_cell('CV %', 10, color)}{'ms/matmul':>11}{'Tensor cores':>14}"
+        f"{bold_cell('Peak', 10, color)}{bold_cell('% of peak', 11, color)}"
     )
     print("-" * 96)
     for r in results:
@@ -200,12 +207,15 @@ def print_table(results, peaks, show_kernels):
         peak = peaks.get(r["precision"])
         peak_text = f"{peak:.1f}" if peak is not None else "n/a"
         percent_text = f"{100 * r['tflops_mean'] / peak:.1f}%" if peak is not None else "n/a"
+        mean_text = f"{r['tflops_mean']:.2f}"
+        cv_text = f"{r['tflops_cv_percent']:.2f}"
         print(
             f"{r['precision']:<10}{r['tflops_worst']:>10.2f}"
-            f"{r['tflops_mean']:>10.2f}{r['tflops_best']:>10.2f}{r['tflops_cv_percent']:>10.2f}"
+            f"{bold_cell(mean_text, 10, color)}{r['tflops_best']:>10.2f}"
+            f"{bold_cell(cv_text, 10, color)}"
             f"{r['ms_mean']:>11.2f}"
             f"{format_tensor_cores(r['tensor_cores']):>14}"
-            f"{peak_text:>10}{percent_text:>11}"
+            f"{bold_cell(peak_text, 10, color)}{bold_cell(percent_text, 11, color)}"
         )
         if show_kernels:
             for kernel in r["kernels"]:
@@ -282,7 +292,8 @@ def main():
         else:
             print("Theoretical peak: unknown for this device (not in the datasheet table)")
         print()
-        print_table(results, peaks, args.show_kernels)
+        color = sys.stdout.isatty()
+        print_table(results, peaks, args.show_kernels, color)
 
 
 if __name__ == "__main__":
