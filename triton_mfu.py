@@ -184,6 +184,8 @@ def main():
         sys.exit("error: triton_mfu.py needs a CUDA GPU; Triton does not run on MPS or CPU")
 
     device = torch.device(args.device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     peaks = theoretical_peak(device)
     n = args.size
