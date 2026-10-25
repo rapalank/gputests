@@ -12,6 +12,8 @@ Precisions:
   tf32  float32 inputs, TF32 tensor-core math enabled (CUDA only, Ampere+)
   fp16  float16
   bf16  bfloat16
+  fp8   float8 e4m3 inputs, bf16 output via torch._scaled_mm (CUDA, Hopper/Ada+)
+  int8  int8 inputs, int32 output via torch._int_mm (CUDA); reported as TOPS-equivalent
 
 Examples:
   python gpu_flops.py
@@ -19,11 +21,16 @@ Examples:
   python gpu_flops.py --device cuda:1 --json
 """
 import argparse
+import contextlib
 import json
 import platform
+import statistics
+import sys
 import time
 
 import torch
+from torch.autograd import DeviceType
+from torch.profiler import ProfilerActivity, profile
 
 # name -> (dtype, requires TF32 flag on CUDA matmul, or None)
 PRECISIONS = {
@@ -32,7 +39,46 @@ PRECISIONS = {
     "tf32": (torch.float32, True),
     "fp16": (torch.float16, None),
     "bf16": (torch.bfloat16, None),
+    "fp8": (torch.float8_e4m3fn, None),
+    "int8": (torch.int8, None),
 }
+
+# Run by default. fp8 and int8 are available with --precisions.
+DEFAULT_PRECISIONS = ["fp64", "fp32", "tf32", "fp16", "bf16"]
+
+# Substrings of cuBLAS kernel names that run on tensor cores:
+# s884/s1688/s16816 = HMMA tile shapes (Volta/Turing/Ampere), xmma/gmma/wgmma/warpgroup = Hopper
+# and newer, hmma/wmma/tensorop = generic markers.
+TENSOR_CORE_KERNEL_MARKERS = (
+    "s884", "s1688", "s16816", "h884", "h1688", "h16816", "hmma", "wmma", "tensorop",
+    "xmma", "gmma", "wgmma", "warpgroup", "nvjet",
+)
+
+# Substrings of kernel names that are plain SIMT GEMMs (no tensor cores), checked first
+# so that e.g. an fp32 "sgemm" or "ffma" kernel is never mistaken for a tensor-core kernel.
+NON_TENSOR_CORE_KERNEL_MARKERS = ("sgemm", "dgemm", "gemv", "ffma")
+
+# Tensor cores need the GEMM dimensions to be multiples of 8 for fp16/bf16 (16 bytes).
+TENSOR_CORE_ALIGNMENT = 8
+
+# Theoretical peak TFLOPS from NVIDIA datasheets, dense (no sparsity). Each entry is
+# (model, variant, peaks): the model must appear in the device name, and the variant
+# (if not None) must too. More specific entries come first.
+THEORETICAL_PEAK_TFLOPS = [
+    ("H200", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989,
+                    "fp8": 1979, "int8": 1979}),
+    ("H100", "PCIe", {"fp64": 51, "fp32": 51, "tf32": 378, "fp16": 756, "bf16": 756,
+                      "fp8": 1513, "int8": 1513}),
+    ("H100", None, {"fp64": 67, "fp32": 67, "tf32": 495, "fp16": 989, "bf16": 989,
+                    "fp8": 1979, "int8": 1979}),
+    ("A100", "PCIe", {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312,
+                      "int8": 624}),
+    ("A100", None, {"fp64": 19.5, "fp32": 19.5, "tf32": 156, "fp16": 312, "bf16": 312,
+                    "int8": 624}),
+    ("L40S", None, {"fp64": 1.4, "fp32": 91.6, "tf32": 183, "fp16": 362, "bf16": 362,
+                    "fp8": 733, "int8": 733}),
+    ("V100", None, {"fp64": 7.8, "fp32": 15.7, "fp16": 125}),
+]
 
 
 def pick_device(name):
@@ -53,6 +99,17 @@ def device_name(device):
     return f"CPU ({platform.processor() or platform.machine()})"
 
 
+def theoretical_peak(device):
+    """Return {precision: peak TFLOPS} from the datasheet table, or {} if the GPU is unknown."""
+    if device.type != "cuda":
+        return {}
+    name = torch.cuda.get_device_name(device)
+    for model, variant, peaks in THEORETICAL_PEAK_TFLOPS:
+        if model in name and (variant is None or variant in name):
+            return peaks
+    return {}
+
+
 def sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -60,110 +117,280 @@ def sync(device):
         torch.mps.synchronize()
 
 
-def time_matmul(dtype, n, device, warmup, iters):
+def is_tensor_core_kernel(name):
+    if any(marker in name for marker in NON_TENSOR_CORE_KERNEL_MARKERS):
+        return False
+    return any(marker in name for marker in TENSOR_CORE_KERNEL_MARKERS)
+
+
+def make_matmul(name, n, device):
+    """Return a zero-argument function that runs one n x n GEMM at precision `name`."""
+    if name == "fp8":
+        if not hasattr(torch, "_scaled_mm"):
+            raise NotImplementedError("torch._scaled_mm is not available in this PyTorch build")
+        # _scaled_mm needs its second operand column-major, hence the transpose.
+        a = torch.randn(n, n, device=device).to(torch.float8_e4m3fn)
+        b = torch.randn(n, n, device=device).to(torch.float8_e4m3fn).t()
+        scale = torch.ones((), device=device, dtype=torch.float32)
+        return lambda: torch._scaled_mm(
+            a, b, scale_a=scale, scale_b=scale, out_dtype=torch.bfloat16
+        )
+    if name == "int8":
+        a = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8)
+        # cuBLASLt's int8 tensor-core kernels want the second operand transposed (TN layout);
+        # other layouts fall back to much slower kernels.
+        b = torch.randint(-128, 128, (n, n), device=device, dtype=torch.int8).t()
+        return lambda: torch._int_mm(a, b)
+
+    dtype = PRECISIONS[name][0]
     a = torch.randn(n, n, device=device, dtype=dtype)
     b = torch.randn(n, n, device=device, dtype=dtype)
     c = torch.empty(n, n, device=device, dtype=dtype)
+    return lambda: torch.mm(a, b, out=c)
 
+
+def uses_tensor_cores(op, device):
+    """Return (tensor_cores, kernel_names). tensor_cores is True/False, or None if unknown.
+
+    Profiles one matmul and inspects the CUDA kernel names. Only CUDA exposes this;
+    MPS and CPU do not report which matrix units a kernel uses, so the result is None.
+    """
+    if device.type != "cuda":
+        return None, []
+
+    op()  # warm up so cuBLAS has selected its kernel before profiling
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        op()
+        torch.cuda.synchronize(device)
+
+    kernels = [e.name for e in prof.events() if e.device_type == DeviceType.CUDA]
+    if not kernels:
+        return None, []
+    return any(is_tensor_core_kernel(k.lower()) for k in kernels), kernels
+
+
+def time_matmul(op, device, warmup, iters):
     for _ in range(warmup):
-        torch.mm(a, b, out=c)
+        op()
     sync(device)
 
     times = []
     for _ in range(iters):
         start = time.perf_counter()
-        torch.mm(a, b, out=c)
+        op()
         sync(device)
         times.append(time.perf_counter() - start)
     return times
 
 
 def run_precision(name, n, device, warmup, iters):
-    dtype, tf32 = PRECISIONS[name]
+    _, tf32 = PRECISIONS[name]
     if tf32 is not None:
         torch.backends.cuda.matmul.allow_tf32 = tf32
 
     flops = 2 * n**3
     try:
-        times = time_matmul(dtype, n, device, warmup, iters)
+        op = make_matmul(name, n, device)
+        times = time_matmul(op, device, warmup, iters)
+        tensor_cores, kernels = uses_tensor_cores(op, device)
     except (RuntimeError, NotImplementedError) as err:
         return {"precision": name, "error": str(err).splitlines()[0]}
 
-    median_s = sorted(times)[len(times) // 2]
-    best_s = min(times)
+    mean_s = statistics.mean(times)
+    tflops = [flops / t / 1e12 for t in times]
     return {
         "precision": name,
-        "tflops_median": flops / median_s / 1e12,
-        "tflops_best": flops / best_s / 1e12,
-        "ms_median": median_s * 1e3,
+        "tensor_cores": tensor_cores,
+        "kernels": kernels,
+        "tflops_mean": statistics.mean(tflops),
+        "tflops_best": max(tflops),
+        "tflops_worst": min(tflops),
+        "tflops_stdev": statistics.stdev(tflops) if len(tflops) > 1 else 0.0,
+        "ms_mean": mean_s * 1e3,
     }
 
 
-def print_table(results):
-    print(f"{'Precision':<10}{'TFLOPS (median)':>18}{'TFLOPS (best)':>16}{'ms/matmul':>12}")
-    print("-" * 56)
+def format_tensor_cores(value):
+    return {True: "yes", False: "NO", None: "n/a"}[value]
+
+
+def bold_cell(text, width, enabled):
+    # Pad before adding the escape codes so the ANSI bytes don't throw off column alignment.
+    padded = f"{text:>{width}}"
+    return f"\033[1m{padded}\033[0m" if enabled else padded
+
+
+def print_table(results, peaks, show_kernels, color):
+    print(
+        "TFLOPS columns: best = fastest iteration, worst = slowest. "
+        "Std % peak = std dev across iterations as a percent of theoretical peak"
+    )
+    print(
+        f"{'Precision':<10}{'Worst':>10}{'Mean':>10}{'Best':>10}"
+        f"{'Peak':>10}{bold_cell('% of peak (worst-best)', 24, color)}"
+        f"{'Std % peak':>12}{'ms/matmul':>11}{'Tensor cores':>14}"
+    )
+    print("-" * 111)
     for r in results:
         if "error" in r:
             print(f"{r['precision']:<10}  skipped: {r['error']}")
             continue
+        peak = peaks.get(r["precision"])
+        peak_text = f"{peak:.1f}" if peak is not None else "n/a"
+        if peak is not None:
+            percent_text = (
+                f"{100 * r['tflops_worst'] / peak:.1f}% - {100 * r['tflops_best'] / peak:.1f}%"
+            )
+            std_text = f"{100 * r['tflops_stdev'] / peak:.2f}"
+        else:
+            percent_text = "n/a"
+            std_text = "n/a"
         print(
-            f"{r['precision']:<10}{r['tflops_median']:>18.2f}"
-            f"{r['tflops_best']:>16.2f}{r['ms_median']:>12.2f}"
+            f"{r['precision']:<10}{r['tflops_worst']:>10.2f}"
+            f"{r['tflops_mean']:>10.2f}{r['tflops_best']:>10.2f}"
+            f"{peak_text:>10}{bold_cell(percent_text, 24, color)}"
+            f"{std_text:>12}"
+            f"{r['ms_mean']:>11.2f}"
+            f"{format_tensor_cores(r['tensor_cores']):>14}"
         )
+        if show_kernels:
+            for kernel in r["kernels"]:
+                print(f"    kernel: {kernel}")
+    if any(r["precision"] == "int8" and "error" not in r for r in results):
+        print(
+            "note: int8 runs through torch._int_mm, which picks Ampere-era cutlass_80 tensor-core "
+            "kernels on Hopper, so its throughput is below the Hopper int8 peak."
+        )
+
+
+def resolve_devices(name):
+    """Return the devices to benchmark. 'auto' uses every CUDA device if there are any."""
+    if name == "auto":
+        if torch.cuda.is_available():
+            return [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+        return [pick_device("auto")]
+    device = pick_device(name)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return [device]
+
+
+def benchmark_device(device, args):
+    """Run every requested precision on one device and return its report."""
+    results = []
+    original_tf32 = torch.backends.cuda.matmul.allow_tf32
+    # Entering the device context keeps CUDA events and streams on this device.
+    context = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
+    try:
+        with context:
+            for name in args.precisions:
+                if name == "tf32" and device.type != "cuda":
+                    results.append({"precision": name, "error": "TF32 is CUDA-only"})
+                    continue
+                if name == "fp64" and device.type == "mps":
+                    results.append({"precision": name, "error": "MPS has no float64"})
+                    continue
+                if name == "fp8" and device.type == "mps":
+                    results.append({"precision": name, "error": "MPS has no float8"})
+                    continue
+                results.append(run_precision(name, args.size, device, args.warmup, args.iters))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original_tf32
+
+    return {
+        "device": str(device),
+        "device_name": device_name(device),
+        "theoretical_peak_tflops": theoretical_peak(device),
+        "results": results,
+    }
+
+
+def print_variation(reports):
+    """Summarize each precision's mean % of peak across devices, skipping devices without a peak."""
+    print()
+    print(f"Variation across {len(reports)} devices (mean TFLOPS as % of theoretical peak):")
+    print(f"{'Precision':<10}{'Min %':>10}{'Mean %':>10}{'Max %':>10}{'CV %':>10}")
+    print("-" * 50)
+    for name in PRECISIONS:
+        percents = []
+        for report in reports:
+            peak = report["theoretical_peak_tflops"].get(name)
+            if not peak:
+                continue
+            for r in report["results"]:
+                if r["precision"] == name and "error" not in r:
+                    percents.append(100 * r["tflops_mean"] / peak)
+        if len(percents) < 2:
+            continue
+        mean = statistics.mean(percents)
+        cv = 100 * statistics.stdev(percents) / mean
+        print(f"{name:<10}{min(percents):>10.1f}{mean:>10.1f}{max(percents):>10.1f}{cv:>10.2f}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto (every CUDA device if any, else mps or cpu), cuda, cuda:N, mps or cpu",
+    )
     parser.add_argument("--size", type=int, default=8192, help="matrix dimension N (default 8192)")
     parser.add_argument("--warmup", type=int, default=5, help="untimed iterations per precision")
     parser.add_argument("--iters", type=int, default=20, help="timed iterations per precision")
     parser.add_argument(
         "--precisions",
         nargs="+",
-        default=list(PRECISIONS),
+        default=DEFAULT_PRECISIONS,
         choices=list(PRECISIONS),
-        help="precisions to test (default: all)",
+        help=f"precisions to test (default: {' '.join(DEFAULT_PRECISIONS)})",
     )
     parser.add_argument("--json", action="store_true", help="print results as JSON")
+    parser.add_argument(
+        "--show-kernels",
+        action="store_true",
+        help="list the CUDA kernel names behind each result (useful when checking tensor cores)",
+    )
     args = parser.parse_args()
 
-    device = pick_device(args.device)
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    devices = resolve_devices(args.device)
 
-    original_tf32 = torch.backends.cuda.matmul.allow_tf32
-    results = []
-    try:
-        for name in args.precisions:
-            if name == "tf32" and device.type != "cuda":
-                results.append({"precision": name, "error": "TF32 is CUDA-only"})
-                continue
-            if name == "fp64" and device.type == "mps":
-                results.append({"precision": name, "error": "MPS has no float64"})
-                continue
-            results.append(run_precision(name, args.size, device, args.warmup, args.iters))
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = original_tf32
+    if args.size % TENSOR_CORE_ALIGNMENT:
+        print(
+            f"warning: --size {args.size} is not a multiple of {TENSOR_CORE_ALIGNMENT}; "
+            "tensor cores may not be used",
+            file=sys.stderr,
+        )
 
+    reports = [benchmark_device(device, args) for device in devices]
     info = {
-        "device": str(device),
-        "device_name": device_name(device),
         "torch": torch.__version__,
         "matrix_size": args.size,
-        "results": results,
+        "devices": reports,
     }
 
     if args.json:
         print(json.dumps(info, indent=2))
-    else:
-        print(f"Device:      {info['device_name']} [{info['device']}]")
-        print(f"PyTorch:     {info['torch']}")
-        print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
+        return
+
+    print(f"PyTorch:     {info['torch']}")
+    print(f"GEMM shape:  {args.size} x {args.size} x {args.size}")
+    for report in reports:
+        peaks = report["theoretical_peak_tflops"]
         print()
-        print_table(results)
+        print(f"Device:      {report['device_name']} [{report['device']}]")
+        if peaks:
+            print("Theoretical peak TFLOPS (dense, datasheet):")
+            print("  " + ", ".join(f"{p}={v:g}" for p, v in peaks.items()))
+        else:
+            print("Theoretical peak: unknown for this device (not in the datasheet table)")
+        print()
+        print_table(report["results"], peaks, args.show_kernels, sys.stdout.isatty())
+    if len(reports) > 1:
+        print_variation(reports)
 
 
 if __name__ == "__main__":
